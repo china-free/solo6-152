@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smart-run"
+version = "0.1.0"
+description = "A smart command-line wrapper that captures output, explains crashes in plain language, and pushes Webhook notifications (Feishu / WeCom)."
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "smart-run" }]
+keywords = ["cli", "wrapper", "error-analysis", "notification", "feishu", "wecom"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Environment :: Console",
+]
+dependencies = []
+
+[project.optional-dependencies]
+llm = []
+
+[project.scripts]
+smart-run = "smart_run.cli:main"
+
+[tool.setuptools]
+packages = ["smart_run"]
+
+[tool.setuptools.package-data]
+smart_run = ["*.json"]
