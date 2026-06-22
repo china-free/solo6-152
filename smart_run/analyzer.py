@@ -12,18 +12,27 @@ The analyzer has two layers:
    asks the model for a short, developer-friendly explanation. The LLM result
    augments -- never replaces -- the local diagnosis, so a network failure or a
    missing key never breaks the tool.
+
+Plugin adapter
+--------------
+:class:`AnalyzerPlugin` wraps :class:`Analyzer` as a :class:`Plugin` so it
+plugs into the lifecycle hook system. It reacts to ``on_end``, writes its
+conclusion to ``ctx.analysis``, and prints a human-readable summary to the
+terminal.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import sys
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .config import Config
+from .hooks import HookContext, Plugin
 from .patterns import PATTERNS
 from .runner import RunResult
 
@@ -256,3 +265,46 @@ def format_for_terminal(analysis: AnalysisResult) -> str:
             parts.append(f"  | {line}")
     parts.append("=========================\n")
     return "\n".join(parts)
+
+
+class AnalyzerPlugin(Plugin):
+    """Lifecycle adapter that runs the analyzer on run end.
+
+    Ordering: register this plugin **before** any notifier plugin, because
+    notifiers expect ``ctx.analysis`` to be populated when their ``on_end``
+    fires.
+
+    Responsibilities
+    ----------------
+    * Run :meth:`Analyzer.analyze` on ``on_end``.
+    * Stash the :class:`AnalysisResult` onto ``ctx.analysis`` for downstream
+      plugins (notifiers, reporters, loggers, ...).
+    * Print a human-readable summary to the terminal (preserves previous
+      behaviour). We write to ``stderr`` when output is being streamed
+      through (so analysis doesn't mix into piped stdout), and to ``stdout``
+      when ``--no-passthrough`` is used (the only output is the analysis).
+    """
+
+    name = "analyzer"
+
+    def __init__(self, config: Config) -> None:
+        self.analyzer = Analyzer(config)
+        self.config = config
+
+    def on_end(self, ctx: HookContext) -> None:
+        result = ctx.result
+        if result is None:
+            return
+        analysis = self.analyzer.analyze(result)
+        ctx.analysis = analysis
+
+        text = format_for_terminal(analysis)
+        if self.config.passthrough is False:
+            out = sys.stdout
+        else:
+            out = sys.stderr
+        try:
+            out.write(text)
+            out.flush()
+        except (OSError, ValueError):
+            pass

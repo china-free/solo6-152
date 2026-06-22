@@ -26,9 +26,10 @@ import sys
 from typing import Any, Dict, List, Optional, Sequence
 
 from . import __version__
-from .analyzer import Analyzer, format_for_terminal
+from .analyzer import AnalyzerPlugin
 from .config import build_config
-from .notifier import Notifier
+from .hooks import PluginManager
+from .notifier import NotifierPlugin
 from .runner import CommandRunner
 
 
@@ -171,29 +172,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     config = build_config(_cli_overrides(args))
 
-    runner = CommandRunner(command, config)
+    # Build the plugin chain. Order matters: analyzer produces ctx.analysis
+    # that notifier consumes, so analyzer registers first.
+    pm = PluginManager()
+    pm.register(AnalyzerPlugin(config))
+    pm.register(NotifierPlugin(config))
+
+    runner = CommandRunner(command, config, plugin_manager=pm)
     result = runner.run()
-
-    analyzer = Analyzer(config)
-    analysis = analyzer.analyze(result)
-
-    if config.passthrough is False:
-        sys.stdout.write(format_for_terminal(analysis))
-        sys.stdout.flush()
-    else:
-        sys.stderr.write(format_for_terminal(analysis))
-        sys.stderr.flush()
-
-    notifier = Notifier(config)
-    if notifier.should_notify(analysis):
-        outcomes = notifier.notify(result, analysis)
-        for outcome in outcomes:
-            stream = sys.stdout if outcome.ok else sys.stderr
-            tag = "ok" if outcome.ok else "FAILED"
-            stream.write(f"[smart-run] notify {outcome.channel}: {tag}"
-                         + (f" ({outcome.detail})" if not outcome.ok and outcome.detail else "")
-                         + "\n")
-            stream.flush()
 
     return result.exit_code if result.exit_code is not None else 1
 

@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from typing import Deque, List, Optional, Sequence
 
 from .config import Config
+from .hooks import HookContext, LifecycleEvent, PluginManager
 
 
 @dataclass
@@ -53,14 +54,16 @@ class RunResult:
 
 
 class CommandRunner:
-    def __init__(self, command: Sequence[str], config: Config) -> None:
+    def __init__(self, command: Sequence[str], config: Config, plugin_manager: Optional[PluginManager] = None) -> None:
         self.command: List[str] = list(command)
         self.config = config
+        self.plugin_manager = plugin_manager or PluginManager()
         self._buffer: Deque[str] = deque(maxlen=max(1, config.tail_lines))
         self._lock = threading.Lock()
         self._log_file = None
         self._timed_out = False
         self._killed_by_timeout = False
+        self._ctx: Optional[HookContext] = None
 
     # ------------------------------------------------------------------ run ---
     def run(self) -> RunResult:
@@ -68,9 +71,19 @@ class CommandRunner:
         if not self.command:
             raise ValueError("no command given to smart-run")
 
+        started = time.time()
+        self._ctx = HookContext(
+            event=LifecycleEvent.START,
+            command=list(self.command),
+            started_at=started,
+        )
+        self.plugin_manager.dispatch(LifecycleEvent.START, self._ctx)
+
         self._open_log()
         self._log_header()
 
+        # --- early failure: can't launch -------------------------------------
+        result: Optional[RunResult] = None
         try:
             popen_kwargs = dict(
                 stdout=subprocess.PIPE,
@@ -86,35 +99,35 @@ class CommandRunner:
                 command_arg = " ".join(self.command)
             else:
                 command_arg = list(self.command)
-                # Let the child inherit our environment so things like
-                # CUDA_VISIBLE_DEVICES keep working.
                 popen_kwargs["env"] = os.environ.copy()
 
-            started = time.time()
             proc = subprocess.Popen(command_arg, **popen_kwargs)
         except FileNotFoundError as exc:
-            self._close_log()
-            return RunResult(
+            result = RunResult(
                 command=self.command,
                 exit_code=127,
                 success=False,
                 duration=0.0,
                 tail=[f"smart-run: command not found: {exc}"],
-                started_at=started if "started" in locals() else 0.0,
+                started_at=started,
                 ended_at=time.time(),
             )
         except OSError as exc:
-            self._close_log()
-            return RunResult(
+            result = RunResult(
                 command=self.command,
                 exit_code=126,
                 success=False,
                 duration=0.0,
                 tail=[f"smart-run: failed to launch: {exc}"],
-                started_at=started if "started" in locals() else 0.0,
+                started_at=started,
                 ended_at=time.time(),
             )
 
+        if result is not None:
+            self._close_log()
+            return self._finalize(result)
+
+        # --- child is running -------------------------------------------------
         threads = [
             threading.Thread(
                 target=self._pump,
@@ -145,14 +158,11 @@ class CommandRunner:
             t.join(timeout=10)
 
         ended = time.time()
-        self._log_footer(exit_code, ended - started)
-        self._close_log()
-
         with self._lock:
             tail = list(self._buffer)
 
         success = exit_code == 0 and not self._killed_by_timeout
-        return RunResult(
+        result = RunResult(
             command=self.command,
             exit_code=exit_code,
             success=success,
@@ -164,6 +174,32 @@ class CommandRunner:
             ended_at=ended,
             signal=proc.returncode if proc.returncode and proc.returncode < 0 else None,
         )
+        self._log_footer(exit_code, ended - started)
+        self._close_log()
+        return self._finalize(result)
+
+    # --------------------------------------------------------------- finalize --
+    def _finalize(self, result: RunResult) -> RunResult:
+        """Patch result onto the shared context and dispatch lifecycle events."""
+        assert self._ctx is not None
+        self._ctx.result = result
+
+        # Timeout path: already dispatched TIMEOUT from the timer thread.
+        if result.timed_out:
+            self._ctx.event = LifecycleEvent.END
+            self.plugin_manager.dispatch(LifecycleEvent.END, self._ctx)
+            return result
+
+        # Always emit END (process has exited, one way or another).
+        self._ctx.event = LifecycleEvent.END
+        self.plugin_manager.dispatch(LifecycleEvent.END, self._ctx)
+
+        # Additionally emit ERROR if the run failed.
+        if not result.success:
+            self._ctx.event = LifecycleEvent.ERROR
+            self.plugin_manager.dispatch(LifecycleEvent.ERROR, self._ctx)
+
+        return result
 
     # --------------------------------------------------------------- pumping --
     def _pump(self, stream, sink, stream_name: str) -> None:
@@ -183,6 +219,12 @@ class CommandRunner:
                     sink.flush()
                 except (OSError, ValueError):
                     pass
+            # Fire OUTPUT event -- PluginManager serializes this internally
+            if self._ctx is not None:
+                self._ctx.event = LifecycleEvent.OUTPUT
+                self._ctx.stream_name = stream_name
+                self._ctx.line = line
+                self.plugin_manager.dispatch(LifecycleEvent.OUTPUT, self._ctx)
         try:
             stream.close()
         except OSError:
@@ -192,6 +234,9 @@ class CommandRunner:
     def _timeout_kill(self, proc: subprocess.Popen) -> None:
         self._timed_out = True
         self._log("stderr", "smart-run: timeout reached, terminating child\n")
+        if self._ctx is not None:
+            self._ctx.event = LifecycleEvent.TIMEOUT
+            self.plugin_manager.dispatch(LifecycleEvent.TIMEOUT, self._ctx)
         try:
             proc.terminate()
             proc.wait(timeout=5)

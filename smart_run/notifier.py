@@ -12,11 +12,18 @@ snippet of the offending output. All HTTP is done with the standard library.
 
 Both are best-effort: a failed push is logged but never raises, so a flaky
 webhook can't mask the real exit code of smart-run itself.
+
+Plugin adapter
+--------------
+:class:`NotifierPlugin` wraps :class:`Notifier` as a :class:`Plugin`. It
+reacts to ``on_end``, reads ``ctx.analysis`` (produced by
+:class:`AnalyzerPlugin`, which must be registered first), and pushes.
 """
 
 from __future__ import annotations
 
 import json
+import sys
 import urllib.request
 import urllib.error
 from dataclasses import dataclass
@@ -24,6 +31,7 @@ from typing import List, Tuple
 
 from .analyzer import AnalysisResult
 from .config import Config
+from .hooks import HookContext, Plugin
 from .runner import RunResult
 
 
@@ -184,3 +192,38 @@ def _fmt_duration(seconds: float) -> str:
         return f"{minutes}m{sec:02d}s"
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h{minutes:02d}m"
+
+
+class NotifierPlugin(Plugin):
+    """Lifecycle adapter that pushes webhook notifications on run end.
+
+    Ordering: register this plugin **after** :class:`AnalyzerPlugin` because
+    it reads ``ctx.analysis``, which the analyzer produces.
+
+    Best-effort: a failed push logs a warning but never raises or modifies
+    the exit code.
+    """
+
+    name = "notifier"
+
+    def __init__(self, config: Config) -> None:
+        self.notifier = Notifier(config)
+        self.config = config
+
+    def on_end(self, ctx: HookContext) -> None:
+        result = ctx.result
+        analysis = ctx.analysis
+        if result is None or analysis is None:
+            return
+        if not self.notifier.should_notify(analysis):
+            return
+        outcomes = self.notifier.notify(result, analysis)
+        for outcome in outcomes:
+            stream = sys.stdout if outcome.ok else sys.stderr
+            tag = "ok" if outcome.ok else "FAILED"
+            detail = f" ({outcome.detail})" if not outcome.ok and outcome.detail else ""
+            try:
+                stream.write(f"[smart-run] notify {outcome.channel}: {tag}{detail}\n")
+                stream.flush()
+            except (OSError, ValueError):
+                pass
