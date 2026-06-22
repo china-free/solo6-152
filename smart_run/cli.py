@@ -67,8 +67,12 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Feishu (Lark) bot webhook URL")
     p.add_argument("--wecom-webhook", default=None, metavar="URL",
                    help="WeCom (企业微信) bot webhook URL")
-    p.add_argument("--notify-on-success", action="store_true", default=None,
-                   help="also notify when the command succeeds")
+    p.add_argument("--notify-on-success", dest="notify_on_success",
+                   action="store_true", default=None,
+                   help="notify when the command succeeds (default: on when any webhook is set)")
+    p.add_argument("--no-notify-on-success", dest="notify_on_success",
+                   action="store_false", default=None,
+                   help="do NOT notify when the command succeeds, only on failure")
     p.add_argument("--no-notify", action="store_true", default=False,
                    help="disable all Webhook notifications for this run")
     p.add_argument("--mention", default=None, metavar="TEXT",

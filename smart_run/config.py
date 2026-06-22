@@ -26,7 +26,7 @@ CONFIG_FILE_CANDIDATES = (
 )
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
+def _env_bool(name: str, default: Optional[bool] = None) -> Optional[bool]:
     raw = os.environ.get(name)
     if raw is None:
         return default
@@ -60,7 +60,7 @@ class Config:
     # --- notification --------------------------------------------------------
     feishu_webhook: str = ""
     wecom_webhook: str = ""
-    notify_on_success: bool = False
+    notify_on_success: bool = True
     mention: str = ""
 
     # --- runtime -------------------------------------------------------------
@@ -97,14 +97,16 @@ def _load_config_file() -> dict[str, Any]:
     return {}
 
 
-def _coerce_int(value: Any, default: int) -> int:
+def _coerce_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    if value is None or value == "":
+        return default
     try:
         return int(value)
     except (TypeError, ValueError):
         return default
 
 
-def _coerce_float(value: Any, default: Optional[float]) -> Optional[float]:
+def _coerce_float(value: Any, default: Optional[float] = None) -> Optional[float]:
     if value is None or value == "":
         return default
     try:
@@ -118,31 +120,33 @@ def from_env() -> dict[str, Any]:
     g = os.environ.get
     llm = {
         "enabled": _env_bool(f"{ENV_PREFIX}LLM_ENABLED"),
-        "base_url": g(f"{ENV_PREFIX}LLM_BASE_URL", ""),
-        "api_key": g(f"{ENV_PREFIX}LLM_API_KEY", ""),
-        "model": g(f"{ENV_PREFIX}LLM_MODEL", "gpt-4o-mini"),
-        "timeout": _coerce_float(g(f"{ENV_PREFIX}LLM_TIMEOUT"), 30.0),
+        "base_url": g(f"{ENV_PREFIX}LLM_BASE_URL"),
+        "api_key": g(f"{ENV_PREFIX}LLM_API_KEY"),
+        "model": g(f"{ENV_PREFIX}LLM_MODEL"),
+        "timeout": _coerce_float(g(f"{ENV_PREFIX}LLM_TIMEOUT")),
     }
     return {
-        "tail_lines": _coerce_int(g(f"{ENV_PREFIX}TAIL_LINES"), 60),
+        "tail_lines": _coerce_int(g(f"{ENV_PREFIX}TAIL_LINES")),
         "analyze_on_success": _env_bool(f"{ENV_PREFIX}ANALYZE_ON_SUCCESS"),
         "use_llm": _env_bool(f"{ENV_PREFIX}USE_LLM"),
         "llm": llm,
-        "feishu_webhook": g(f"{ENV_PREFIX}FEISHU_WEBHOOK", ""),
-        "wecom_webhook": g(f"{ENV_PREFIX}WECOM_WEBHOOK", ""),
+        "feishu_webhook": g(f"{ENV_PREFIX}FEISHU_WEBHOOK"),
+        "wecom_webhook": g(f"{ENV_PREFIX}WECOM_WEBHOOK"),
         "notify_on_success": _env_bool(f"{ENV_PREFIX}NOTIFY_ON_SUCCESS"),
-        "mention": g(f"{ENV_PREFIX}MENTION", ""),
-        "log_file": g(f"{ENV_PREFIX}LOG_FILE", ""),
-        "passthrough": _env_bool(f"{ENV_PREFIX}PASSTHROUGH", True),
+        "mention": g(f"{ENV_PREFIX}MENTION"),
+        "log_file": g(f"{ENV_PREFIX}LOG_FILE"),
+        "passthrough": _env_bool(f"{ENV_PREFIX}PASSTHROUGH"),
         "shell": _env_bool(f"{ENV_PREFIX}SHELL"),
-        "cwd": g(f"{ENV_PREFIX}CWD", ""),
-        "timeout": _coerce_float(g(f"{ENV_PREFIX}TIMEOUT"), None),
+        "cwd": g(f"{ENV_PREFIX}CWD"),
+        "timeout": _coerce_float(g(f"{ENV_PREFIX}TIMEOUT")),
     }
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     result = dict(base)
     for key, value in override.items():
+        if value is None:
+            continue
         if (
             key in result
             and isinstance(result[key], dict)
@@ -150,8 +154,29 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
         ):
             result[key] = _deep_merge(result[key], value)
         else:
+            if value == "" and key in result and result[key] not in (None, ""):
+                continue
             result[key] = value
     return result
+
+
+def _prune_none(d: dict[str, Any]) -> dict[str, Any]:
+    """Recursively remove keys whose value is None (or empty dict).
+
+    We treat None as "not set at this layer", so dataclass defaults keep
+    applying instead of getting clobbered by explicit None.
+    """
+    out: dict[str, Any] = {}
+    for k, v in d.items():
+        if v is None:
+            continue
+        if isinstance(v, dict):
+            pruned = _prune_none(v)
+            if pruned:
+                out[k] = pruned
+        else:
+            out[k] = v
+    return out
 
 
 def build_config(cli_overrides: Optional[dict[str, Any]] = None) -> Config:
@@ -161,6 +186,7 @@ def build_config(cli_overrides: Optional[dict[str, Any]] = None) -> Config:
     merged = _deep_merge(merged, from_env())
     if cli_overrides:
         merged = _deep_merge(merged, cli_overrides)
+    merged = _prune_none(merged)
 
     llm_raw = merged.pop("llm", None) or {}
     if not isinstance(llm_raw, dict):
